@@ -133,12 +133,23 @@ class Client:
         ws_host = self.config.get("server_ws_host", "127.0.0.1")
         ws_port = self.config.get("server_ws_port", 8443)
         ws_path = "/"
+        use_tls = self.config.get("server_ws_tls", self.mode == "wss")
         
-        logger.info(f"[{client_id}] WSS Tunnel: {target_host}:{target_port} через {ws_host}:{ws_port}")
+        logger.info(f"[{client_id}] WSS Tunnel: {target_host}:{target_port} через {ws_host}:{ws_port} (TLS: {use_tls})")
         
         try:
             # 1. Подключение к WSS
-            ws = await RawWebSocket.connect(ws_host, ws_port, ws_path)
+            ssl_context = None
+            if use_tls:
+                import ssl
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+
+            ws = await asyncio.wait_for(
+                RawWebSocket.connect(ws_host, ws_port, ws_path, ssl_context=ssl_context),
+                timeout=10.0
+            )
             
             # 2. Передача команды
             cmd = json.dumps({"host": target_host, "port": target_port}).encode('utf-8')

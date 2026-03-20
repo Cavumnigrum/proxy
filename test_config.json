@@ -1,0 +1,1 @@
+{"mode": "wss", "server_ws_host": "127.0.0.1", "server_ws_port": 8443, "local_socks5_port": 1081, "server_ws_tls": true, "bypass_domains": [], "bypass_ips": []}

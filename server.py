@@ -107,11 +107,57 @@ class Server:
             if target_writer:
                 target_writer.close()
             
-    async def start(self):
+    async def start(self, use_tls: bool = False):
         """Запуск сервера."""
-        server = await asyncio.start_server(self.handle_client, self.host, self.port)
+        ssl_context = None
+        if use_tls:
+            import ssl
+            import tempfile
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+            import datetime
+            
+            # Генерируем временный самоподписанный сертификат для тестирования, 
+            # если пользователь не указал свои пути.
+            key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COMMON_NAME, u"universal-ws-proxy"),
+            ])
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.datetime.utcnow()
+            ).not_valid_after(
+                datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            ).sign(key, hashes.SHA256())
+            
+            with tempfile.NamedTemporaryFile(delete=False) as key_f:
+                key_f.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+                key_path = key_f.name
+                
+            with tempfile.NamedTemporaryFile(delete=False) as cert_f:
+                cert_f.write(cert.public_bytes(serialization.Encoding.PEM))
+                cert_path = cert_f.name
+                
+            ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+
+        server = await asyncio.start_server(self.handle_client, self.host, self.port, ssl=ssl_context)
         addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-        logger.info(f"Server (Universal WS Proxy) запущен на {addrs}")
+        logger.info(f"Server (Universal WS Proxy) запущен на {addrs} (TLS: {use_tls})")
         
         async with server:
             await server.serve_forever()
@@ -120,10 +166,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Universal WebSocket Proxy Server")
     parser.add_argument("--host", default="0.0.0.0", help="Хост для прослушивания")
     parser.add_argument("--port", type=int, default=8443, help="Порт для прослушивания")
+    parser.add_argument("--tls", action="store_true", help="Включить поддержку TLS (WSS)")
     args = parser.parse_args()
     
     srv = Server(args.host, args.port)
     try:
-        asyncio.run(srv.start())
+        asyncio.run(srv.start(use_tls=args.tls))
     except KeyboardInterrupt:
         logger.info("Сервер остановлен.")

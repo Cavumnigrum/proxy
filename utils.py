@@ -57,7 +57,7 @@ class RawWebSocket:
         self.closed = False
 
     @classmethod
-    async def connect(cls, host: str, port: int, path: str = "/") -> 'RawWebSocket':
+    async def connect(cls, host: str, port: int, path: str = "/", ssl_context=None) -> 'RawWebSocket':
         """
         Устанавливает соединение с сервером по WSS.
         Оставлено без SSL для тестирования локально или через TLS Termination Proxy.
@@ -67,6 +67,7 @@ class RawWebSocket:
             host (str): Адрес сервера.
             port (int): Порт сервера.
             path (str): Путь запроса.
+            ssl_context: Контекст SSL для защищенного соединения WSS.
             
         Returns:
             RawWebSocket: Объект соединения.
@@ -74,7 +75,7 @@ class RawWebSocket:
         Raises:
             WSError: Ошибка рукопожатия.
         """
-        reader, writer = await asyncio.open_connection(host, port)
+        reader, writer = await asyncio.open_connection(host, port, ssl=ssl_context)
         ws_key = base64.b64encode(os.urandom(16)).decode('utf-8')
         
         req = (
@@ -253,5 +254,8 @@ class RawWebSocket:
         except Exception:
             pass
         finally:
-            self.writer.close()
-            await self.writer.wait_closed()
+            try:
+                self.writer.close()
+                await self.writer.wait_closed()
+            except Exception:
+                pass
