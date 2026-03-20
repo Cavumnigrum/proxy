@@ -198,7 +198,11 @@ class Client:
             await ws.close()
             
         except Exception as e:
-            logger.error(f"[{client_id}] WSS error to {target_host}:{target_port} - {e}")
+            if isinstance(e, asyncio.TimeoutError):
+                err_msg = "TimeoutError (Сервер недоступен, проверьте firewall на VDS)"
+            else:
+                err_msg = str(e) or repr(e)
+            logger.error(f"[{client_id}] WSS error to {target_host}:{target_port} - {err_msg}")
             writer.write(b'\x05\x05\x00\x01' + b'\x00'*6)
             await writer.drain()
 
