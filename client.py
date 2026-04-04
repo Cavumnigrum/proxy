@@ -118,6 +118,15 @@ class Client:
                 asyncio.open_connection(target_host, target_port), timeout=10.0
             )
             
+            # Оптимизация сокета для прямого соединения
+            if t_writer.transport:
+                sock = t_writer.transport.get_extra_info('socket')
+                if sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    # Крупные буферы для обхода
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+            
             # Успешный ответ SOCKS5
             writer.write(b'\x05\x00\x00\x01' + b'\x00'*6)
             await writer.drain()
@@ -179,7 +188,10 @@ class Client:
             writer.write(b'\x05\x00\x00\x01' + b'\x00'*6)
             await writer.drain()
             
-            # 4. Мост
+            # 4. Мост с «умным» дренажем (позволяет нескольким пакетам быть в полете)
+            if writer.transport:
+                writer.transport.set_write_buffer_limits(high=1024 * 1024 * 2) # 2MB
+            
             async def ws_to_tcp():
                 try:
                     while True:
@@ -187,18 +199,23 @@ class Client:
                         if data is None:
                             break
                         writer.write(data)
-                        await writer.drain()
+                        # Drain только если буфер реально заполнен (> 1MB)
+                        if writer.transport.get_write_buffer_size() > 1024 * 1024:
+                            await writer.drain()
                 except Exception as e:
                     logger.debug(f"[{client_id}] wss->tcp error: {e}")
 
             async def tcp_to_ws():
                 try:
                     while True:
-                        # Увеличиваем размер порции данных до 128КБ для снижения накладных расходов
                         data = await reader.read(131072)
                         if not data:
                             break
                         await ws.send(data)
+                        # RawWebSocket.send теперь не делает drain внутри, 
+                        # поэтому делаем его здесь при необходимости
+                        if ws.writer.transport.get_write_buffer_size() > 1024 * 1024:
+                            await ws.writer.drain()
                 except Exception as e:
                     logger.debug(f"[{client_id}] tcp->wss error: {e}")
                     
@@ -265,17 +282,21 @@ class Client:
                 self._ssh_conn = None
 
     async def _bridge(self, r1, w1, r2, w2):
-        """Двунаправленная пересылка данных."""
+        """Двунаправленная пересылка данных с оптимизацией буферов."""
+        # Увеличиваем лимиты для обоих писателей
+        for w in (w1, w2):
+            if w.transport:
+                w.transport.set_write_buffer_limits(high=1024 * 1024 * 2)
+
         async def forward(src, dst):
             try:
                 while True:
-                    # Оптимальный буфер для SSH и Direct соединений
                     data = await src.read(131072)
                     if not data:
                         break
                     dst.write(data)
-                    # Drain только если буфер переполнен (автоматически делает asyncio)
-                    await dst.drain()
+                    if dst.transport.get_write_buffer_size() > 1024 * 1024:
+                        await dst.drain()
             except Exception:
                 pass
                 

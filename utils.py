@@ -54,6 +54,7 @@ class RawWebSocket:
         self.writer = writer
         self.is_client = is_client
         self.closed = False
+        self._mask_cache = {} # Кэш для ускорения XOR (длина -> маска_rep)
 
     @classmethod
     async def connect(cls, host: str, port: int, path: str = "/", ssl_context=None) -> 'RawWebSocket':
@@ -185,9 +186,18 @@ class RawWebSocket:
         n = len(data)
         if n == 0:
             return b""
-        # Генерируем повторяющуюся маску нужной длины
-        mask_rep = (mask * (n // 4 + 1))[:n]
-        # XOR через int.from_bytes (быстрее чем циклы в чистом Python)
+            
+        # Кэшируем маску для частотных размеров кадров (например, 128КБ)
+        cache_key = (mask, n)
+        if cache_key in self._mask_cache:
+            mask_rep = self._mask_cache[cache_key]
+        else:
+            mask_rep = (mask * (n // 4 + 1))[:n]
+            # Ограничиваем размер кэша
+            if len(self._mask_cache) < 10:
+                self._mask_cache[cache_key] = mask_rep
+
+        # XOR через int.from_bytes (самый быстрый способ в чистом Python)
         return (int.from_bytes(data, 'big') ^ int.from_bytes(mask_rep, 'big')).to_bytes(n, 'big')
 
     async def send(self, data: bytes, is_text: bool = False):
@@ -225,7 +235,7 @@ class RawWebSocket:
             self.writer.write(bytes(header))
             self.writer.write(data)
             
-        await self.writer.drain()
+        # Drain теперь управляется вызывающей стороной (мостом) для оптимизации
 
     async def recv(self) -> Optional[bytes]:
         """

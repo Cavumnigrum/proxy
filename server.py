@@ -65,7 +65,12 @@ class Server:
                 await ws.send(json.dumps({"status": "error", "msg": str(e)}).encode('utf-8'), is_text=True)
                 return
 
-            # Функции моста
+            # Мост с оптимизацией буферов
+            if target_writer.transport:
+                target_writer.transport.set_write_buffer_limits(high=1024 * 1024 * 2)
+            if ws.writer.transport:
+                ws.writer.transport.set_write_buffer_limits(high=1024 * 1024 * 2)
+
             async def ws_to_tcp():
                 try:
                     while True:
@@ -73,18 +78,21 @@ class Server:
                         if data is None:
                             break
                         target_writer.write(data)
-                        await target_writer.drain()
+                        if target_writer.transport.get_write_buffer_size() > 1024 * 1024:
+                            await target_writer.drain()
                 except Exception as e:
                     logger.debug(f"[{client_ip}] Ошибка ws->tcp: {e}")
 
             async def tcp_to_ws():
                 try:
                     while True:
-                        # Увеличиваем буфер до 128КБ для оптимизации загрузки (Download)
+                        # Используем 128КБ буфер для отдачи
                         data = await target_reader.read(131072)
                         if not data:
                             break
                         await ws.send(data)
+                        if ws.writer.transport.get_write_buffer_size() > 1024 * 1024:
+                            await ws.writer.drain()
                 except Exception as e:
                     logger.debug(f"[{client_ip}] Ошибка tcp->ws: {e}")
 
