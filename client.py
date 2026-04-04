@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 import os
 import struct
 import socket
@@ -8,7 +7,7 @@ from typing import Dict, Any, Optional
 
 import asyncssh
 
-from utils import RawWebSocket, setup_logger, WSError
+from utils import RawWebSocket, setup_logger
 
 logger = setup_logger("client")
 
@@ -25,6 +24,10 @@ class Client:
         # но для упрощения первой итерации пока просто проверяем точные совпадения IP, 
         # либо можно написать простую логику маски.
         self.bypass_ips = set(self.config.get("bypass_ips", []))
+        
+        # Пул соединений для SSH и WSS
+        self._ssh_conn: Optional[asyncssh.SSHClientConnection] = None
+        self._ssh_lock = asyncio.Lock()
         
     def _load_config(self, path: str) -> Dict[str, Any]:
         """Загрузка JSON конфига."""
@@ -128,7 +131,7 @@ class Client:
 
     async def _handle_wss(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_host: str, target_port: int, client_id: str):
         """Туннелирование через WSS сервер."""
-        ws_url = self.config.get("server_ws_url", "wss://127.0.0.1:8443")
+        # Упрощенный парсинг параметров прокси из конфига
         # Упрощенный парсинг URL (без поддержки wss напрямую, так как мы пишем чистый raw, предполагаем либо ws либо tls terminating proxy)
         ws_host = self.config.get("server_ws_host", "127.0.0.1")
         ws_port = self.config.get("server_ws_port", 8443)
@@ -148,8 +151,16 @@ class Client:
 
             ws = await asyncio.wait_for(
                 RawWebSocket.connect(ws_host, ws_port, ws_path, ssl_context=ssl_context),
-                timeout=10.0
+                timeout=15.0
             )
+            
+            # Настройка сокета на максимальную производительность
+            if ws.writer.transport:
+                sock = ws.writer.transport.get_extra_info('socket')
+                if sock:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
             
             # 2. Передача команды
             cmd = json.dumps({"host": target_host, "port": target_port}).encode('utf-8')
@@ -183,7 +194,8 @@ class Client:
             async def tcp_to_ws():
                 try:
                     while True:
-                        data = await reader.read(65536)
+                        # Увеличиваем размер порции данных до 128КБ для снижения накладных расходов
+                        data = await reader.read(131072)
                         if not data:
                             break
                         await ws.send(data)
@@ -206,28 +218,37 @@ class Client:
             writer.write(b'\x05\x05\x00\x01' + b'\x00'*6)
             await writer.drain()
 
+    async def _get_ssh_conn(self):
+        """Возвращает активное SSH соединение из пула или создает новое."""
+        async with self._ssh_lock:
+            if self._ssh_conn and not self._ssh_conn.is_closing():
+                return self._ssh_conn
+                
+            ssh_host = self.config.get("ssh_host", "127.0.0.1")
+            ssh_port = self.config.get("ssh_port", 22)
+            ssh_user = self.config.get("ssh_user", "root")
+            ssh_key = self.config.get("ssh_key", "")
+            
+            kwargs = {'username': ssh_user, 'known_hosts': None}
+            if ssh_key:
+                if os.path.exists(ssh_key):
+                    kwargs['client_keys'] = [ssh_key]
+                else:
+                    # Если путь не существует, пробуем использовать как пароль
+                    kwargs['password'] = ssh_key
+            
+            self._ssh_conn = await asyncssh.connect(ssh_host, port=ssh_port, **kwargs)
+            return self._ssh_conn
+
     async def _handle_ssh(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, target_host: str, target_port: int, client_id: str):
-        """Туннелирование через SSH."""
-        ssh_host = self.config.get("ssh_host", "127.0.0.1")
-        ssh_port = self.config.get("ssh_port", 22)
-        ssh_user = self.config.get("ssh_user", "root")
-        ssh_key = self.config.get("ssh_key", "")
-        
-        logger.info(f"[{client_id}] SSH Tunnel: {target_host}:{target_port} через {ssh_host}:{ssh_port}")
+        """Туннелирование через SSH с использованием пула соединений."""
+        logger.info(f"[{client_id}] SSH Tunnel: {target_host}:{target_port}")
         
         try:
-            kwargs = {}
-            if ssh_key and os.path.exists(ssh_key):
-                kwargs['client_keys'] = [ssh_key]
+            conn = await self._get_ssh_conn()
             
-            # Установка SSH соединения
-            # Примечание: В production лучше держать одно постоянное SSH-соединение (pool),
-            # но для первой итерации мы создаем новое соединение для простоты
-            async with asyncssh.connect(ssh_host, port=ssh_port, username=ssh_user, known_hosts=None, **kwargs) as conn:
-                
-                # Открытие прямого TCP-форвардинга внутри SSH
-                ssh_reader, ssh_writer = await conn.open_connection(target_host, target_port)
-                
+            # Открытие прямого TCP-форвардинга внутри SSH (создает новый канал в существующем соединении)
+            async with conn.create_connection(None, target_host, target_port) as (ssh_reader, ssh_writer):
                 # SOCKS5 OK
                 writer.write(b'\x05\x00\x00\x01' + b'\x00'*6)
                 await writer.drain()
@@ -239,16 +260,21 @@ class Client:
             logger.error(f"[{client_id}] SSH error to {target_host}:{target_port} - {e}")
             writer.write(b'\x05\x05\x00\x01' + b'\x00'*6)
             await writer.drain()
+            # Очищаем пул при критической ошибке соединения
+            async with self._ssh_lock:
+                self._ssh_conn = None
 
     async def _bridge(self, r1, w1, r2, w2):
         """Двунаправленная пересылка данных."""
         async def forward(src, dst):
             try:
                 while True:
-                    data = await src.read(65536)
+                    # Оптимальный буфер для SSH и Direct соединений
+                    data = await src.read(131072)
                     if not data:
                         break
                     dst.write(data)
+                    # Drain только если буфер переполнен (автоматически делает asyncio)
                     await dst.drain()
             except Exception:
                 pass

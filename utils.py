@@ -219,9 +219,11 @@ class RawWebSocket:
         if self.is_client:
             mask = os.urandom(4)
             header.extend(mask)
-            self.writer.write(bytes(header) + self._xor_mask(data, mask))
+            self.writer.write(bytes(header))
+            self.writer.write(self._xor_mask(data, mask))
         else:
-            self.writer.write(bytes(header) + data)
+            self.writer.write(bytes(header))
+            self.writer.write(data)
             
         await self.writer.drain()
 

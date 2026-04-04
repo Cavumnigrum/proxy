@@ -80,7 +80,8 @@ class Server:
             async def tcp_to_ws():
                 try:
                     while True:
-                        data = await target_reader.read(65536)
+                        # Увеличиваем буфер до 128КБ для оптимизации загрузки (Download)
+                        data = await target_reader.read(131072)
                         if not data:
                             break
                         await ws.send(data)
