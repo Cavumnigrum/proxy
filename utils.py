@@ -1,11 +1,10 @@
 import asyncio
 import base64
 import hashlib
-import json
 import logging
 import os
 import struct
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional
 
 class WSError(Exception):
     """Исключение для ошибок WebSocket."""
@@ -105,52 +104,76 @@ class RawWebSocket:
         return cls(reader, writer, is_client=True)
 
     @classmethod
-    async def accept(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> Optional['RawWebSocket']:
+    async def accept(cls, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, timeout: float = 10.0) -> Optional['RawWebSocket']:
         """
-        Принимает WS-соединение на сервере.
+        Принимает WS-соединение на сервере с поддержкой таймаута и расширенного логирования.
         
         Args:
             reader (asyncio.StreamReader): Поток чтения.
             writer (asyncio.StreamWriter): Поток записи.
+            timeout (float): Максимальное время ожидания рукопожатия.
             
         Returns:
             Optional[RawWebSocket]: Соединение или None, если запрос не валиден.
         """
         headers = {}
-        first_line = await reader.readline()
-        if not first_line:
-            return None
+        try:
+            # Читаем первую строку (метод, путь, протокол)
+            first_line_raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+            if not first_line_raw:
+                return None
             
-        while True:
-            line = await reader.readline()
-            if line == b'\r\n' or not line:
-                break
-            parts = line.decode('utf-8', 'ignore').strip().split(":", 1)
-            if len(parts) == 2:
-                headers[parts[0].strip().lower()] = parts[1].strip()
+            # Проверка на TLS Client Hello (0x16 0x03 ...)
+            # Если сервер запущен в режиме Plaintext, а клиент шлет TLS - мы увидим это здесь.
+            if first_line_raw.startswith(b'\x16\x03'):
+                logger = logging.getLogger("server")
+                logger.error("Обнаружен TLS Client Hello на Plaintext порту! Проверьте, что сервер запущен с флагом --tls.")
+                return None
 
-        ws_key = headers.get("sec-websocket-key")
-        if not ws_key:
-            return None
+            first_line = first_line_raw.decode('utf-8', 'ignore').strip()
+            if not first_line.upper().startswith("GET"):
+                return None
+                
+            # Читаем остальные заголовки
+            while True:
+                line_raw = await asyncio.wait_for(reader.readline(), timeout=timeout)
+                if line_raw == b'\r\n' or not line_raw:
+                    break
+                line = line_raw.decode('utf-8', 'ignore').strip()
+                parts = line.split(":", 1)
+                if len(parts) == 2:
+                    headers[parts[0].strip().lower()] = parts[1].strip()
+
+            ws_key = headers.get("sec-websocket-key")
+            if not ws_key:
+                return None
+                
+            # Генерация ответа (RFC 6455)
+            magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            accept_key = base64.b64encode(hashlib.sha1(ws_key.encode() + magic).digest()).decode()
             
-        # Генерация ответа (RFC 6455)
-        magic = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        accept_key = base64.b64encode(hashlib.sha1(ws_key.encode() + magic).digest()).decode()
-        
-        res = (
-            "HTTP/1.1 101 Switching Protocols\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
-        )
-        writer.write(res.encode())
-        await writer.drain()
-        
-        return cls(reader, writer, is_client=False)
+            res = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+            )
+            writer.write(res.encode())
+            await writer.drain()
+            
+            return cls(reader, writer, is_client=False)
+            
+        except asyncio.TimeoutError:
+            return None
+        except Exception as e:
+            logger = logging.getLogger("server")
+            logger.debug(f"Ошибка во время WS handshake: {e}")
+            return None
 
     def _xor_mask(self, data: bytes, mask: bytes) -> bytes:
         """
         Применяет XOR-маскирование к данным.
+        Выполняется через большие целые числа для производительности в Python.
         
         Args:
             data (bytes): Исходные данные.
@@ -159,10 +182,12 @@ class RawWebSocket:
         Returns:
             bytes: Маскированные данные.
         """
-        mask_int = int.from_bytes(mask, 'big')
         n = len(data)
-        # Быстрый XOR без циклов, генерируем маску нужной длины
+        if n == 0:
+            return b""
+        # Генерируем повторяющуюся маску нужной длины
         mask_rep = (mask * (n // 4 + 1))[:n]
+        # XOR через int.from_bytes (быстрее чем циклы в чистом Python)
         return (int.from_bytes(data, 'big') ^ int.from_bytes(mask_rep, 'big')).to_bytes(n, 'big')
 
     async def send(self, data: bytes, is_text: bool = False):

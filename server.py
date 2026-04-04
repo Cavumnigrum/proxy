@@ -1,9 +1,8 @@
 import asyncio
 import argparse
 import json
-import logging
-from typing import Optional, Tuple
-from utils import RawWebSocket, setup_logger, WSError
+from typing import Optional
+from utils import RawWebSocket, setup_logger
 
 logger = setup_logger("server")
 
@@ -29,10 +28,10 @@ class Server:
         target_writer: Optional[asyncio.StreamWriter] = None
         
         try:
-            # Принимаем WS-рукопожатие
-            ws = await RawWebSocket.accept(client_reader, client_writer)
+            # Принимаем WS-рукопожатие с таймаутом
+            ws = await RawWebSocket.accept(client_reader, client_writer, timeout=10.0)
             if not ws:
-                logger.warning(f"[{client_ip}] Неверный WS handshake.")
+                logger.warning(f"[{client_ip}] Неверный WS handshake (проверьте TLS/WSS настройки или наличие Proxy).")
                 client_writer.close()
                 return
                 
