@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -25,12 +26,23 @@ import (
 )
 
 // =============================================================================
-// Конфигурация
+// Конфигурация: ключевые параметры производительности
 // =============================================================================
 
 const (
-	wsBufSize  = 64 * 1024
-	tcpBufSize = 64 * 1024
+	// TCP буфер (send/receive) для WS-туннеля.
+	// BDP для 200Mbps @ 150ms RTT = 3.75MB. Ставим 4MB.
+	tcpBufSize = 4 * 1024 * 1024
+
+	// Размер буферов gorilla/websocket для WS-фреймов.
+	// Большие буферы = меньше системных вызовов.
+	wsBufSize = 256 * 1024
+
+	// Размер чанка чтения из TCP-сокета.
+	readBufSize = 128 * 1024
+
+	// Размер очереди данных на стрим.
+	streamQueueSize = 128
 )
 
 const (
@@ -60,47 +72,38 @@ func encodeMuxFrame(f *muxFrame) []byte {
 
 func decodeMuxFrame(data []byte) (*muxFrame, error) {
 	if len(data) < 9 {
-		return nil, fmt.Errorf("frame too short: %d bytes", len(data))
+		return nil, fmt.Errorf("frame too short: %d", len(data))
 	}
 	f := &muxFrame{
 		Cmd:      data[0],
 		StreamID: binary.BigEndian.Uint32(data[1:5]),
 	}
-	payloadLen := binary.BigEndian.Uint32(data[5:9])
-	if int(payloadLen) != len(data)-9 {
-		return nil, fmt.Errorf("payload mismatch: %d vs %d", payloadLen, len(data)-9)
+	pLen := binary.BigEndian.Uint32(data[5:9])
+	if int(pLen) != len(data)-9 {
+		return nil, fmt.Errorf("payload mismatch")
 	}
 	f.Payload = data[9:]
 	return f, nil
 }
 
 // =============================================================================
-// stream — безопасная обёртка над каналом данных
+// stream — безопасная обёртка канала данных
 // =============================================================================
 
-// stream инкапсулирует канал данных и sync.Once для безопасного закрытия.
-// Это устраняет panic "close of closed channel".
 type stream struct {
-	ch       chan []byte
-	once     sync.Once
-	streamID uint32
+	ch   chan []byte
+	once sync.Once
+	id   uint32
 }
 
-func newStream(id uint32, bufSize int) *stream {
-	return &stream{
-		ch:       make(chan []byte, bufSize),
-		streamID: id,
-	}
+func newStream(id uint32) *stream {
+	return &stream{ch: make(chan []byte, streamQueueSize), id: id}
 }
 
-// Close безопасно закрывает канал (можно вызывать многократно).
 func (st *stream) Close() {
-	st.once.Do(func() {
-		close(st.ch)
-	})
+	st.once.Do(func() { close(st.ch) })
 }
 
-// Send отправляет данные в канал. Возвращает false если канал полон.
 func (st *stream) Send(data []byte) bool {
 	select {
 	case st.ch <- data:
@@ -108,6 +111,35 @@ func (st *stream) Send(data []byte) bool {
 	default:
 		return false
 	}
+}
+
+// =============================================================================
+// optimizeTCP — настройка TCP-сокета для максимальной пропускной способности
+// =============================================================================
+
+func optimizeTCP(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(tcpBufSize)
+		_ = tc.SetWriteBuffer(tcpBufSize)
+	}
+}
+
+// =============================================================================
+// bufferListener — слушатель, автоматически настраивающий TCP-буферы
+// =============================================================================
+
+type bufferListener struct {
+	net.Listener
+}
+
+func (bl *bufferListener) Accept() (net.Conn, error) {
+	conn, err := bl.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	optimizeTCP(conn)
+	return conn, nil
 }
 
 // =============================================================================
@@ -146,7 +178,6 @@ func (s *Server) sendFrame(f *muxFrame) error {
 	return s.wsConn.WriteMessage(websocket.BinaryMessage, encodeMuxFrame(f))
 }
 
-// removeStream удаляет стрим из карты и безопасно закрывает его.
 func (s *Server) removeStream(id uint32) {
 	s.streamsMu.Lock()
 	st, ok := s.streams[id]
@@ -161,15 +192,13 @@ func (s *Server) removeStream(id uint32) {
 
 func (s *Server) handleStream(streamID uint32, targetHost string, targetPort int) {
 	target := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	log.Printf("[S][Ch:%d] → %s", streamID, target)
+	log.Printf("[S][%d] → %s", streamID, target)
 
 	defer func() {
 		s.removeStream(streamID)
 		_ = s.sendFrame(&muxFrame{Cmd: cmdClose, StreamID: streamID})
-		log.Printf("[S][Ch:%d] ✕ %s", streamID, target)
 	}()
 
-	// Получаем стрим из карты.
 	s.streamsMu.Lock()
 	st, ok := s.streams[streamID]
 	s.streamsMu.Unlock()
@@ -179,23 +208,18 @@ func (s *Server) handleStream(streamID uint32, targetHost string, targetPort int
 
 	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		log.Printf("[S][Ch:%d] Ошибка: %v", streamID, err)
+		log.Printf("[S][%d] dial error: %v", streamID, err)
 		return
 	}
 	defer conn.Close()
-
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-		_ = tc.SetReadBuffer(256 * 1024)
-		_ = tc.SetWriteBuffer(256 * 1024)
-	}
+	optimizeTCP(conn)
 
 	done := make(chan struct{}, 2)
 
-	// Целевой сервер → WS (Download).
+	// Target → WS (Download для браузера).
 	go func() {
 		defer func() { done <- struct{}{} }()
-		buf := make([]byte, tcpBufSize)
+		buf := make([]byte, readBufSize)
 		for {
 			n, err := conn.Read(buf)
 			if n > 0 {
@@ -213,7 +237,7 @@ func (s *Server) handleStream(streamID uint32, targetHost string, targetPort int
 		}
 	}()
 
-	// WS → Целевой сервер (Upload).
+	// WS → Target (Upload от браузера).
 	go func() {
 		defer func() { done <- struct{}{} }()
 		for data := range st.ch {
@@ -243,7 +267,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	peer := r.RemoteAddr
 	log.Printf("[S] Туннель: %s", peer)
-
 	s.wsConn = ws
 	ws.SetReadLimit(0)
 
@@ -258,7 +281,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		frame, err := decodeMuxFrame(msg)
 		if err != nil {
-			log.Printf("[S] Frame decode error: %v", err)
 			continue
 		}
 
@@ -269,10 +291,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 				Port int    `json:"port"`
 			}
 			if err := json.Unmarshal(frame.Payload, &info); err != nil {
-				log.Printf("[S] OPEN parse error: %v", err)
 				continue
 			}
-			st := newStream(frame.StreamID, 64)
+			st := newStream(frame.StreamID)
 			s.streamsMu.Lock()
 			s.streams[frame.StreamID] = st
 			s.streamsMu.Unlock()
@@ -318,34 +339,48 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  priv,
-	}, nil
+	return tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: priv}, nil
 }
 
 func (s *Server) run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleWS)
-	server := &http.Server{Addr: s.listenAddr, Handler: mux}
+
+	// Создаём TCP-слушатель с увеличенными буферами.
+	rawLn, err := net.Listen("tcp", s.listenAddr)
+	if err != nil {
+		return fmt.Errorf("listen error: %w", err)
+	}
+	bufferedLn := &bufferListener{rawLn}
 
 	if s.autoTLS || (s.tlsCert != "" && s.tlsKey != "") {
+		var tlsConfig *tls.Config
 		if s.autoTLS {
 			cert, err := generateSelfSignedCert()
 			if err != nil {
 				return fmt.Errorf("TLS gen error: %w", err)
 			}
-			server.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
-			log.Printf("[S] TLS: самоподписанный сертификат")
-			log.Printf("[S] Слушаю на %s (WSS)", s.listenAddr)
-			return server.ListenAndServeTLS("", "")
+			tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			log.Printf("[S] TLS: auto-generated certificate")
+		} else {
+			cert, err := tls.LoadX509KeyPair(s.tlsCert, s.tlsKey)
+			if err != nil {
+				return fmt.Errorf("TLS load error: %w", err)
+			}
+			tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+			log.Printf("[S] TLS: %s / %s", s.tlsCert, s.tlsKey)
 		}
-		log.Printf("[S] TLS: %s / %s", s.tlsCert, s.tlsKey)
-		log.Printf("[S] Слушаю на %s (WSS)", s.listenAddr)
-		return server.ListenAndServeTLS(s.tlsCert, s.tlsKey)
+
+		tlsLn := tls.NewListener(bufferedLn, tlsConfig)
+		log.Printf("[S] Слушаю на %s (WSS, TCP buf=%dMB)", s.listenAddr, tcpBufSize/1024/1024)
+
+		server := &http.Server{Handler: mux}
+		return server.Serve(tlsLn)
 	}
-	log.Printf("[S] Слушаю на %s (WS, без TLS)", s.listenAddr)
-	return server.ListenAndServe()
+
+	log.Printf("[S] Слушаю на %s (WS, TCP buf=%dMB)", s.listenAddr, tcpBufSize/1024/1024)
+	server := &http.Server{Handler: mux}
+	return server.Serve(bufferedLn)
 }
 
 // =============================================================================
@@ -407,18 +442,30 @@ func (c *Client) ensureConnection() (*websocket.Conn, error) {
 	}
 
 	dialer := websocket.Dialer{
+		// Критически важно: перехватываем TCP-соединение чтобы
+		// выставить SO_SNDBUF / SO_RCVBUF = 4MB ДО TLS-хендшейка.
+		// Без этого Windows использует дефолтные ~64KB буферы,
+		// что при RTT=115ms ограничивает upload до ~4.4 Mbps.
+		NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{Timeout: 15 * time.Second}
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			optimizeTCP(conn)
+			log.Printf("[C] TCP буферы: %dMB (send/recv)", tcpBufSize/1024/1024)
+			return conn, nil
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: c.skipVerify},
 		ReadBufferSize:  wsBufSize,
 		WriteBufferSize: wsBufSize,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: c.skipVerify,
-		},
 		HandshakeTimeout: 15 * time.Second,
 	}
 
 	log.Printf("[C] Подключение к %s...", c.serverURL)
 	ws, _, err := dialer.Dial(c.serverURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("WS dial error: %w", err)
+		return nil, fmt.Errorf("WS dial: %w", err)
 	}
 
 	ws.SetReadLimit(0)
@@ -465,7 +512,6 @@ func (c *Client) readLoop(ws *websocket.Conn) {
 			if ok {
 				st.Send(frame.Payload)
 			}
-
 		case cmdClose:
 			c.removeStream(frame.StreamID)
 		}
@@ -475,25 +521,21 @@ func (c *Client) readLoop(ws *websocket.Conn) {
 func (c *Client) handleSOCKS5(conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
 	buf := make([]byte, 258)
 
-	// 1. SOCKS5 Hello.
 	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
 		return
 	}
 	if buf[0] != 0x05 {
 		return
 	}
-	nMethods := int(buf[1])
-	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+	if _, err := io.ReadFull(conn, buf[:int(buf[1])]); err != nil {
 		return
 	}
 	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
 		return
 	}
 
-	// 2. SOCKS5 CONNECT.
 	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
 		return
 	}
@@ -532,22 +574,19 @@ func (c *Client) handleSOCKS5(conn net.Conn) {
 		return
 	}
 	targetPort := int(binary.BigEndian.Uint16(buf[:2]))
-
 	_ = conn.SetDeadline(time.Time{})
 
 	if _, err := c.ensureConnection(); err != nil {
-		log.Printf("[C] Ошибка подключения к серверу: %v", err)
+		log.Printf("[C] Server connect error: %v", err)
 		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
 	streamID := c.nextID.Add(1) - 1
-	st := newStream(streamID, 64)
-
+	st := newStream(streamID)
 	c.streamsMu.Lock()
 	c.streams[streamID] = st
 	c.streamsMu.Unlock()
-
 	defer c.removeStream(streamID)
 
 	info, _ := json.Marshal(struct {
@@ -561,14 +600,13 @@ func (c *Client) handleSOCKS5(conn net.Conn) {
 	}
 
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	log.Printf("[C][Ch:%d] → %s:%d", streamID, targetHost, targetPort)
 
 	done := make(chan struct{}, 2)
 
 	// Браузер → WS (Upload).
 	go func() {
 		defer func() { done <- struct{}{} }()
-		readBuf := make([]byte, tcpBufSize)
+		readBuf := make([]byte, readBufSize)
 		for {
 			n, err := conn.Read(readBuf)
 			if n > 0 {
@@ -605,13 +643,10 @@ func (c *Client) run() error {
 	if err != nil {
 		return fmt.Errorf("listen error: %w", err)
 	}
-	log.Printf("[C] SOCKS5 прокси на %s", c.socksAddr)
-	log.Printf("[C] Сервер: %s", c.serverURL)
-
+	log.Printf("[C] SOCKS5 на %s → %s", c.socksAddr, c.serverURL)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			log.Printf("[C] Accept error: %v", err)
 			continue
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
@@ -626,13 +661,13 @@ func (c *Client) run() error {
 // =============================================================================
 
 func main() {
-	mode := flag.String("mode", "", "Режим: 'server' или 'client'")
+	mode := flag.String("mode", "", "'server' или 'client'")
 	listen := flag.String("listen", "", "Адрес прослушки")
 	serverURL := flag.String("server", "", "URL сервера (wss://...)")
-	tlsCert := flag.String("tls-cert", "", "TLS сертификат (сервер)")
-	tlsKey := flag.String("tls-key", "", "TLS ключ (сервер)")
-	autoTLS := flag.Bool("tls", false, "Авто-генерация TLS (сервер)")
-	insecure := flag.Bool("insecure", true, "Пропустить TLS-верификацию (клиент)")
+	tlsCert := flag.String("tls-cert", "", "TLS сертификат")
+	tlsKey := flag.String("tls-key", "", "TLS ключ")
+	autoTLS := flag.Bool("tls", false, "Авто TLS")
+	insecure := flag.Bool("insecure", true, "Пропустить TLS verify")
 
 	flag.Parse()
 	log.SetOutput(os.Stdout)
@@ -644,8 +679,7 @@ func main() {
 		if addr == "" {
 			addr = "0.0.0.0:8443"
 		}
-		srv := newServer(addr, *tlsCert, *tlsKey, *autoTLS)
-		log.Fatal(srv.run())
+		log.Fatal(newServer(addr, *tlsCert, *tlsKey, *autoTLS).run())
 
 	case "client":
 		addr := *listen
@@ -655,15 +689,12 @@ func main() {
 		if *serverURL == "" {
 			log.Fatal("Укажите -server wss://HOST:PORT")
 		}
-		cl := newClient(addr, *serverURL, *insecure)
-		log.Fatal(cl.run())
+		log.Fatal(newClient(addr, *serverURL, *insecure).run())
 
 	default:
 		fmt.Fprintln(os.Stderr, "Universal Proxy (Go)")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "  Сервер: proxy -mode server -listen 0.0.0.0:8443 -tls")
-		fmt.Fprintln(os.Stderr, "  Клиент: proxy -mode client -server wss://89.22.237.64:8443")
-		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "  Сервер: proxy -mode server -tls")
+		fmt.Fprintln(os.Stderr, "  Клиент: proxy -mode client -server wss://IP:8443")
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
