@@ -144,7 +144,11 @@ if __name__ == "__main__":
             with tempfile.NamedTemporaryFile(delete=False) as cert_file, \
                  tempfile.NamedTemporaryFile(delete=False) as key_file:
                 cert_file.write(cert.public_bytes(serialization.Encoding.PEM))
-                key_file.write(key.private_bytes(serialization.Encoding.PEM, serialization.NoEncryption(), serialization.PrivateFormat.TraditionalOpenSSL))
+                key_file.write(key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
                 cert_path, key_path = cert_file.name, key_file.name
 
             ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
